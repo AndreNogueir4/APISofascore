@@ -1,5 +1,4 @@
 from requests import Response
-
 from src.Common.NetworkManager import NetworkManager
 
 
