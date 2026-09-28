@@ -1,2 +1,5 @@
 requests
 playwright
+motor
+fastapi
+uvicorn
