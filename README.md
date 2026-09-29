@@ -23,10 +23,11 @@ sport (football | volleyball | basketball | tennis | mma)
 Separação por responsabilidade, uma classe por camada:
 
 ```
-api.py                          # API HTTP (FastAPI) + dashboard
-start.py                        # seeder: popula o catálogo no Mongo
 static/index.html               # dashboard de placares (zero dependências)
 src/
+├── __main__.py                 # CLI: serve | seed | crawl | methods
+├── Api.py                      # API HTTP (FastAPI) + dashboard
+├── Seeder.py                   # popula o catálogo no Mongo
 ├── Common/
 │   ├── NetworkManager.py       # transporte HTTP puro (requests.Session)
 │   ├── BrowserTransport.py     # transporte via Chromium (default) — passa pelo anti-bot
@@ -54,8 +55,9 @@ src/
 - **`DatabaseManager`** — wrapper assíncrono (Motor) sobre o MongoDB: `upsert_one/many` (idempotente, por chave de negócio), `find_one/all`, `ensure_unique_index`. Usa os IDs do próprio Sofascore como chave (`id_team`, `id_event`, `id_tournament`, `alpha2`, `slug`), então reimportar o mesmo dado nunca duplica.
 - **`CacheRepository`** — padrão **cache-aside**: consulta o Mongo antes de bater no Sofascore e grava o resultado no miss. Todo endpoint que usa cache aceita `?refresh=true` para forçar a ida à origem.
 - **`SofascoreExtractors`** — funções puras que reduzem o payload gigante do Sofascore ao essencial. `extract_sports`/`extract_countries` derivam o catálogo da própria resposta (em vez de lista fixa, que envelhece); `find_teams` varre recursivamente procurando objetos com "cara" de time.
-- **`api.py`** — FastAPI. O `SofascoreContainer` é criado **fora** do event loop (o Playwright Sync API não roda dentro de um loop já em execução) e as chamadas bloqueantes do crawler vão para `asyncio.to_thread`, então o `requests` não travar o loop. Índices únicos são garantidos no `lifespan`.
-- **`start.py`** — seeder idempotente: popula `countries`, `sports` e `teams` de uma vez, para a API já subir com catálogo quente.
+- **`Api.py`** — FastAPI. O `SofascoreContainer` é criado **fora** do event loop (o Playwright Sync API não roda dentro de um loop já em execução) e as chamadas bloqueantes do crawler vão para `asyncio.to_thread`, então o `requests` não travar o loop. Índices únicos são garantidos no `lifespan`.
+- **`Seeder.py`** — seeder idempotente: popula `countries`, `sports` e `teams`, para a API já subir com catálogo quente. O `seed()` recebe quais alvos popular, então dá para rodar só uma parte.
+- **`__main__.py`** — ponto de entrada único (`python -m src`). Traduz os argumentos de linha de comando nas variáveis de ambiente **antes** de qualquer import, então a escolha de transporte/banco vale para o processo inteiro, inclusive para o `uvicorn --reload` (que reimporta `src.Api:app` num subprocesso).
 
 ### Divisão do cache
 
@@ -83,23 +85,44 @@ As duas últimas são o escape hatch: com ambas definidas, `build_container()` n
 Sem elas ele tenta capturar e, se o Sofascore recusar, avisa no log e sobe com os defaults em vez
 de derrubar a API.
 
+Toda variável da tabela tem um argumento equivalente na CLI (`--transport`, `--show-browser`,
+`--x-requested-with`, `--build-id`, `--mongo-uri`, `--mongo-db`), aceito **antes** do comando.
+
 ```bash
 .venv/bin/pip install -r requirements.txt
 .venv/bin/playwright install chromium
 
-.venv/bin/python start.py                              # (opcional) popula o catálogo
-.venv/bin/uvicorn api:app --host 0.0.0.0 --port 8000   # API + dashboard
+.venv/bin/python -m src seed                 # (opcional) popula o catálogo
+.venv/bin/python -m src serve --port 8000    # API + dashboard
 ```
 
 - dashboard de placares: <http://localhost:8000/>
 - Swagger: <http://localhost:8000/docs>
+
+### CLI (`python -m src`)
+
+Um ponto de entrada, quatro comandos. `python -m src --help` (ou `<comando> --help`) lista tudo.
+
+| Comando | Para quê |
+|---|---|
+| `serve` | sobe a API + dashboard — `--host`, `--port`, `--reload`, `--log-level` |
+| `seed` | popula o Mongo — `--only countries sports teams`, `--country` (repetível), `--sport` |
+| `crawl` | chama **um** método do crawler e imprime o JSON — `--compact` |
+| `methods` | lista os 120 métodos com a assinatura — `--grep TEXTO` |
+
+```bash
+.venv/bin/python -m src serve --port 8000 --reload
+.venv/bin/python -m src seed --only teams --country BR --country AR
+.venv/bin/python -m src --transport requests crawl country_alpha
+.venv/bin/python -m src methods --grep standings
+```
 
 ### Endpoints da API
 
 | Método | Rota | Descrição |
 |---|---|---|
 | `GET` | `/live?sport=football` | jogos em andamento agora, com placar |
-| `GET` | `/events/today?sport=football&on=YYYY-MM-DD` | agenda do dia |
+| `GET` | `/events/today?sport=football&on=YYYY-MM-DD` | agenda do dia — **quebrado na origem**, ver abaixo |
 | `GET` | `/events/{id}` | detalhe da partida |
 | `GET` | `/events/{id}/h2h` | confrontos diretos |
 | `GET` | `/teams/{id}` | perfil do time |
@@ -109,11 +132,39 @@ de derrubar a API.
 | `GET` | `/countries`, `/sports` | catálogo |
 | `GET` | `/health` | healthcheck |
 
+### `/events/today` está quebrado na origem
+
+A Sofascore **removeu** `/sport/{sport}/scheduled-events/{date}` (responde `404`). O site passou a
+montar a agenda em duas etapas: `/sport/{sport}/scheduled-tournaments/{date}/page/{n}` para listar
+os torneios do dia e depois `/unique-tournament/{id}/scheduled-events/{date}` para os jogos de cada
+um. Os dois endpoints funcionam e já existem no crawler (`sport_scheduled_tournaments`,
+`unique_tournament_scheduled_events`).
+
+O problema é o custo: num dia medido foram **7 páginas / 454 torneios distintos = 461 requests**
+(~3 min, serializadas pelo `min_interval`). Não cabe dentro de uma request HTTP. Usar só os
+torneios em destaque (`default_unique_tournaments`, 22 torneios) não resolve: em data FIFA eles
+têm zero jogos enquanto as seleções jogam.
+
+Por ora o endpoint **falha alto** — `502` com a explicação no `detail` — em vez de devolver lista
+vazia. O parser trata `404` como "dado ausente" e devolvia `None`, que o `extract_events`
+transformava em `[]`, tornando o erro indistinguível de "não tem jogo hoje". Para jogos em
+andamento use `/live`, que não foi afetado.
+
 ### Usando só o crawler (sem API/Mongo)
 
+O comando `crawl` faz o bind dos argumentos pela própria assinatura do método: posicionais na
+ordem declarada, `chave=valor` para nomeados, com `int`/`float`/`bool`/`None` convertidos. Nome de
+método errado ou argumento faltando falha na hora (exit `2`), antes de subir o Chromium.
+
 ```bash
-.venv/bin/python main.py
+.venv/bin/python -m src methods --grep season          # descobre o que existe
+.venv/bin/python -m src crawl country_alpha
+.venv/bin/python -m src crawl sport_categories_all football
+.venv/bin/python -m src crawl season_standings 325 87678
+.venv/bin/python -m src crawl sport_events_live football --compact
 ```
+
+Ou direto do Python, sem passar pela CLI:
 
 ```python
 from src.Sofascore.SofascoreContainer import SofascoreContainer
@@ -184,7 +235,7 @@ Decisões que isso implica:
   `ThreadPoolExecutor(max_workers=1)` é o dono do browser e recebe todas as chamadas. Efeito
   colateral bem-vindo: rate limiting natural, com `min_interval` espaçando as requisições.
 - **`raise_for_status()` levanta `requests.HTTPError`.** Assim o handler de `RequestException`
-  da `api.py` continua convertendo falha de origem em `502` sem saber qual transporte gerou.
+  da `Api.py` continua convertendo falha de origem em `502` sem saber qual transporte gerou.
 - **`404` continua sendo "dado ausente"**, não erro — o contrato que o parser já esperava.
 - **Headers proibidos pelo `fetch`** (`Referer`, `User-Agent`, `Cookie`, `Accept-Encoding`…) são
   filtrados de propósito: quem manda neles é o browser. O `X-Requested-With` passa normalmente.
@@ -198,12 +249,17 @@ O transporte foi validado ponta a ponta contra um servidor local que confirma a 
 (`User-Agent` do Chromium + `sec-fetch-*` presentes), cobrindo: `200`/`404`/`500`, `json()`/`text`,
 `params`, repasse de `X-Requested-With`, 16 threads simultâneas, `asyncio.to_thread` e o throttle.
 
-**Contra o Sofascore real ainda não foi confirmado:** durante o desenvolvimento o IP levou um
-bloqueio mais amplo e passou a receber `403` até no `page.goto`, o que impede a validação final.
-Quando o bloqueio sair, o teste é `SOFASCORE_TRANSPORT=browser` + `GET /live`. Se o `403`
-persistir mesmo com a página carregando, o próximo suspeito é o `HeadlessChrome` no `User-Agent`
-e no `sec-ch-ua` (visível para a origem) — daí valeria rodar com `SOFASCORE_HEADLESS=0` ou com
-o Chrome real (`channel='chrome'`) para comparar.
+**Contra o Sofascore real: confirmado.** Com o transporte de browser (headless, sem ajuste
+nenhum) a origem respondeu `200`: `crawl country_alpha` devolveu o geo-IP correto,
+`sport_categories_all` 298 categorias, `sport_events_live` 78 jogos com placar, e o
+`python -m src seed` gravou 274 países / 19 esportes / 69 times em 30s. Pela API, 12 dos 13
+endpoints responderam `200` (o 13º é o `/events/today`, quebrado na origem — ver acima).
+
+**O `403` é intermitente e sensível a volume.** Uma varredura de ~460 requests (paginação de
+`scheduled-tournaments`) derrubou o IP em `403` de novo poucos minutos depois, inclusive em
+`/country/alpha2`, mesmo com o `page.goto` continuando a carregar normalmente. Ou seja: o bloqueio
+não é só de fingerprint, tem também um componente de rate limit por volume. O `min_interval` de
+0,4s não é suficiente para uma varredura grande — reforça o item de backoff no roadmap.
 
 ## Roadmap / o que falta
 
@@ -213,12 +269,14 @@ e a camada de **serviço** (API + cache + dashboard).
 - [x] Persistência em banco (MongoDB) com os IDs do Sofascore como chave — `DatabaseManager`
 - [x] Deduplicação/upsert via índice único + `bulk_write` idempotente
 - [x] Cache na frente da própria API (Mongo, cache-aside) — `CacheRepository`
-- [x] API própria (FastAPI) servindo os dados já normalizados — `api.py`
+- [x] API própria (FastAPI) servindo os dados já normalizados — `src/Api.py`
 - [x] Dashboard de placares ao vivo — `static/index.html`
 - [x] **Transporte via browser** — `BrowserNetworkManager`, default (ver seção acima)
 - [x] Rate limiting básico — `min_interval` entre chamadas, natural por serem serializadas
-- [ ] Retry com backoff exponencial (hoje o erro sobe direto para o handler)
-- [ ] Confirmar o transporte contra o Sofascore real (IP bloqueado durante o desenvolvimento)
+- [x] Confirmar o transporte contra o Sofascore real — `200` na origem com o transporte de browser
+- [ ] Retry com backoff exponencial (hoje o erro sobe direto para o handler) — o `403` volta sob volume
+- [ ] Reconstruir `/events/today` pelo caminho novo (`scheduled-tournaments` + por torneio), como job
+  em background com cache no Mongo: 461 requests não cabem numa request HTTP
 - [ ] Histórico para dados "de série no tempo" (odds, standings) — hoje o upsert sobrescreve
 - [ ] Scheduler com frequência por tipo de dado (catálogo 1x/semana, jogos do dia 1x/hora, ao vivo a cada 15-30s)
 - [ ] TTL no cache — hoje o documento salvo não expira, só o `?refresh=true` força a atualização
