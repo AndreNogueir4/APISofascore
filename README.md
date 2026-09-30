@@ -30,7 +30,7 @@ src/
 ├── Seeder.py                   # popula o catálogo no Mongo
 ├── Common/
 │   ├── NetworkManager.py       # transporte HTTP puro (requests.Session)
-│   ├── BrowserTransport.py     # transporte via Chromium (default) — passa pelo anti-bot
+│   ├── BrowserTransport.py     # transporte via Firefox (default) — passa pelo anti-bot
 │   ├── DatabaseManager.py      # acesso assíncrono ao MongoDB (Motor)
 │   ├── CacheRepository.py      # cache-aside: Mongo primeiro, Sofascore em miss
 │   └── SofascoreExtractors.py  # normaliza a resposta crua (eventos, países, esportes, times)
@@ -51,7 +51,7 @@ src/
 
 ### Camada de serviço (API + cache)
 
-- **`BrowserNetworkManager`** (`BrowserTransport.py`) — transporte default. Faz a chamada de dentro da página (`fetch` via `page.evaluate`), herdando TLS, HTTP/2, headers `sec-*` e cookies do Chromium. Mantém a interface `get()/head()/close()` e devolve um `BrowserResponse` com `status_code`/`json()`/`text`/`raise_for_status()`, então **nenhum dos 120 `build_*`/`parse_*` mudou**. Um único browser por processo, com todas as chamadas serializadas num worker thread (a Sync API do Playwright só pode ser tocada pela thread que a criou) e espaçadas por `min_interval`.
+- **`BrowserNetworkManager`** (`BrowserTransport.py`) — transporte default. Faz a chamada de dentro da página (`fetch` via `page.evaluate`), herdando TLS, HTTP/2, headers `sec-*` e cookies do browser. Mantém a interface `get()/head()/close()` e devolve um `BrowserResponse` com `status_code`/`json()`/`text`/`raise_for_status()`, então **nenhum dos 120 `build_*`/`parse_*` mudou**. Um único browser por processo, com todas as chamadas serializadas num worker thread (a Sync API do Playwright só pode ser tocada pela thread que a criou) e espaçadas por `min_interval`.
 - **`DatabaseManager`** — wrapper assíncrono (Motor) sobre o MongoDB: `upsert_one/many` (idempotente, por chave de negócio), `find_one/all`, `ensure_unique_index`. Usa os IDs do próprio Sofascore como chave (`id_team`, `id_event`, `id_tournament`, `alpha2`, `slug`), então reimportar o mesmo dado nunca duplica.
 - **`CacheRepository`** — padrão **cache-aside**: consulta o Mongo antes de bater no Sofascore e grava o resultado no miss. Todo endpoint que usa cache aceita `?refresh=true` para forçar a ida à origem.
 - **`SofascoreExtractors`** — funções puras que reduzem o payload gigante do Sofascore ao essencial. `extract_sports`/`extract_countries` derivam o catálogo da própria resposta (em vez de lista fixa, que envelhece); `find_teams` varre recursivamente procurando objetos com "cara" de time.
@@ -77,7 +77,8 @@ Requer **MongoDB** em `localhost:27017`.
 | `MONGO_URI` | `mongodb://localhost:27017` | conexão do Mongo |
 | `MONGO_DB` | `apisofascore` | nome do banco |
 | `SOFASCORE_TRANSPORT` | `browser` | `requests` volta para a `requests.Session` (leve, mas leva 403) |
-| `SOFASCORE_HEADLESS` | `1` | `0` abre o Chromium com janela, para depurar |
+| `SOFASCORE_BROWSER` | `firefox` | engine do Playwright; `chromium` leva captcha (ver abaixo) |
+| `SOFASCORE_HEADLESS` | `1` | `0` abre o browser com janela, para depurar |
 | `SOFASCORE_X_REQUESTED_WITH` | captura no browser | pula a captura no boot |
 | `SOFASCORE_BUILD_ID` | captura no browser | idem |
 
@@ -85,12 +86,13 @@ As duas últimas são o escape hatch: com ambas definidas, `build_container()` n
 Sem elas ele tenta capturar e, se o Sofascore recusar, avisa no log e sobe com os defaults em vez
 de derrubar a API.
 
-Toda variável da tabela tem um argumento equivalente na CLI (`--transport`, `--show-browser`,
-`--x-requested-with`, `--build-id`, `--mongo-uri`, `--mongo-db`), aceito **antes** do comando.
+Toda variável da tabela tem um argumento equivalente na CLI (`--transport`, `--browser`,
+`--show-browser`, `--x-requested-with`, `--build-id`, `--mongo-uri`, `--mongo-db`), aceito
+**antes** do comando.
 
 ```bash
 .venv/bin/pip install -r requirements.txt
-.venv/bin/playwright install chromium
+.venv/bin/playwright install firefox     # engine default; chromium é opcional
 
 .venv/bin/python -m src seed                 # (opcional) popula o catálogo
 .venv/bin/python -m src serve --port 8000    # API + dashboard
@@ -154,7 +156,7 @@ andamento use `/live`, que não foi afetado.
 
 O comando `crawl` faz o bind dos argumentos pela própria assinatura do método: posicionais na
 ordem declarada, `chave=valor` para nomeados, com `int`/`float`/`bool`/`None` convertidos. Nome de
-método errado ou argumento faltando falha na hora (exit `2`), antes de subir o Chromium.
+método errado ou argumento faltando falha na hora (exit `2`), antes de subir o browser.
 
 ```bash
 .venv/bin/python -m src methods --grep season          # descobre o que existe
@@ -214,12 +216,13 @@ browser — mesmo com `X-Requested-With`, `User-Agent` e cookies corretos:
 
 O bloqueio não é de IP nem de endpoint: a mesma URL, no mesmo IP, chamada de dentro do contexto
 do browser respondeu `200`. O que a `requests.Session` não reproduz é o TLS/HTTP2 e o conjunto de
-headers `sec-*` do Chromium. Por isso o transporte default passou a ser o `BrowserNetworkManager`:
+headers `sec-*` de um browser real. Por isso o transporte default passou a ser o
+`BrowserNetworkManager`:
 
 ```
 crawler -> factory (monta URL + headers)
              -> BrowserNetworkManager.get()
-                  -> worker thread (dono do Chromium)
+                  -> worker thread (dono do browser)
                        -> page.evaluate(fetch(...))   # herda TLS/HTTP2/sec-*/cookies
                   <- BrowserResponse (status_code, json(), text, raise_for_status())
              <- parser (inalterado)
@@ -227,7 +230,7 @@ crawler -> factory (monta URL + headers)
 
 Decisões que isso implica:
 
-- **Um browser por processo.** O Chromium sobe no primeiro `get()` e vive até o `close()`. O
+- **Um browser por processo.** O browser sobe no primeiro `get()` e vive até o `close()`. O
   `SofascoreContainer` aceita `network=` justamente para o `build_container()` reaproveitar a
   mesma instância no caminho de fallback em vez de subir um segundo.
 - **Tudo serializado.** A Sync API do Playwright só pode ser usada pela thread que criou os
@@ -241,19 +244,77 @@ Decisões que isso implica:
   filtrados de propósito: quem manda neles é o browser. O `X-Requested-With` passa normalmente.
 
 O modo antigo continua disponível com `SOFASCORE_TRANSPORT=requests` — é bem mais leve (sem
-Chromium) para quando a origem aceitar.
+browser) para quando a origem aceitar.
+
+### O engine importa: Chromium leva captcha, Firefox não
+
+Em setembro de 2026 o anti-bot apertou, e o Chromium do Playwright passou a ser **desafiado antes
+de carregar a home**. O `page.goto('https://www.sofascore.com/pt')` é redirecionado para
+`/captcha.html?redirectUrl=...`, uma página de Cloudflare Turnstile. A cascata:
+
+- sem `__NEXT_DATA__` na página de desafio → `next_build_id` fica `None`
+- nenhum XHR para `/api/v1/` → `x_requested_with` fica `None`
+- `fetch_dynamic_params()` levanta, `build_container()` cai nos defaults
+- todo request de dados volta `403 {"reason": "challenge"}` → `502` na API
+
+O desafio não é algo que se resolva no código: é um veredito de fingerprint, dado antes de
+qualquer validação existir. Mas ele **não é disparado em outro engine**. Medido no mesmo IP, na
+mesma máquina:
+
+| engine | captcha | `buildId` | requests `/api/v1/` | `x-requested-with` |
+|---|---|---|---|---|
+| chromium (headless e headed) | **sim** | `None` | 0 | — |
+| firefox headless | não | capturado | 282 | capturado |
+| firefox headed | não | capturado | 282 | capturado |
+
+Nem UA realista nem `--disable-blink-features=AutomationControlled` nem rodar com janela salvam o
+Chromium. Por isso o default é **`firefox`**, com `--browser chromium` mantido para quando a maré
+virar. Se o engine for desafiado, o aviso no boot diz isso explicitamente em vez de reclamar
+genericamente da captura.
+
+**O valor do `X-Requested-With` não é o que libera a chamada.** Medido de dentro de uma página
+Firefox não desafiada, o mesmo `/sport/football/events/live` respondeu `200` com 413891 bytes em
+todos os casos:
+
+| `X-Requested-With` | resposta |
+|---|---|
+| `2589dc` (default antigo) | `200` |
+| `d063ba` (capturado horas antes) | `200` |
+| `deadbeef` (lixo) | `200` |
+| vazio | `200` |
+| header ausente | `200` |
+
+Ou seja: o token nunca foi a causa dos `403`, e os defaults vencidos eram inofensivos. O que a
+origem avalia é o **contexto do browser** (fingerprint, TLS, cookies), não o header. O header
+continua sendo capturado e enviado por fidelidade ao que o site faz, mas não conte com ele como
+chave de acesso — e não gaste tempo caçando o valor "certo".
+
+Dois detalhes que isso deixou claro:
+
+- **A página de desafio vem com `200`.** Qualquer checagem de `response.ok` passa batido nela; o
+  que denuncia é a URL (`_challenged()`).
+- **O `X-Requested-With` só aparece no primeiro XHR**, depois do `domcontentloaded`. Ler os
+  parâmetros logo após o `goto` funciona ou não conforme a sorte de timing — daí o
+  `_await_api_call()` esperando o handler preencher.
 
 ### Estado da verificação
 
 O transporte foi validado ponta a ponta contra um servidor local que confirma a origem da chamada
-(`User-Agent` do Chromium + `sec-fetch-*` presentes), cobrindo: `200`/`404`/`500`, `json()`/`text`,
+(`User-Agent` do browser + `sec-fetch-*` presentes), cobrindo: `200`/`404`/`500`, `json()`/`text`,
 `params`, repasse de `X-Requested-With`, 16 threads simultâneas, `asyncio.to_thread` e o throttle.
 
-**Contra o Sofascore real: confirmado.** Com o transporte de browser (headless, sem ajuste
-nenhum) a origem respondeu `200`: `crawl country_alpha` devolveu o geo-IP correto,
-`sport_categories_all` 298 categorias, `sport_events_live` 78 jogos com placar, e o
-`python -m src seed` gravou 274 países / 19 esportes / 69 times em 30s. Pela API, 12 dos 13
-endpoints responderam `200` (o 13º é o `/events/today`, quebrado na origem — ver acima).
+**Contra o Sofascore real: confirmado** (Chromium, antes do captcha). A origem respondeu `200`:
+`crawl country_alpha` devolveu o geo-IP correto, `sport_categories_all` 298 categorias,
+`sport_events_live` 78 jogos com placar, e o `python -m src seed` gravou 274 países / 19 esportes
+/ 69 times em 30s. Pela API, 12 dos 13 endpoints responderam `200` (o 13º é o `/events/today`,
+quebrado na origem — ver acima).
+
+**Reconfirmado em 2026-09-30, com Firefox headless.** Boot limpo, sem cair nos defaults
+(`x_requested_with` e `next_build_id` capturados na home). `/live?sport=football` respondeu `200`
+em três chamadas consecutivas — 99 jogos com placar, 4,5s / 1,8s / 0,7s (a primeira paga o boot do
+browser). Também `200` em `/live?sport=basketball`, `/tournaments/325`,
+`/tournaments/325/standings`, `/events/{id}`, `/teams/{id}`, `/countries`, `/sports` e `/health`.
+Três boots seguidos da CLI sem nenhum `[aviso]`.
 
 **O `403` é intermitente e sensível a volume.** Uma varredura de ~460 requests (paginação de
 `scheduled-tournaments`) derrubou o IP em `403` de novo poucos minutos depois, inclusive em
